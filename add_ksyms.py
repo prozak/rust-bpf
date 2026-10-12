@@ -473,6 +473,43 @@ def drop_defined_declares(m):
 text = re.sub(r'^declare\s[^\n]*\n(?:[ \t]+section[^\n]*\n)?',
               drop_defined_declares, text, flags=re.MULTILINE)
 
+# Make the caller extend small integers returned by extern functions.
+#
+# rustc's BPF calling convention marks a bool/u8/u16 return `zeroext` and an
+# i8/i16 return `signext`. On a call that is a promise that the callee already
+# extended the value to 32 bits, and llc believes it: the result is tested or
+# used as a whole register. But the callee here is a kfunc compiled for the
+# host, and e.g. the x86-64 ABI defines only the low 8 bits of a returned
+# bool. clang makes no such promise for BPF (returns are plain i1/i8/i16), so
+# llc masks or sign-extends after every such call. Drop the attribute from
+# extern declares and their call sites to get the same code. Calls to
+# functions the module defines keep it: there the callee is BPF code that
+# does extend.
+_EXT = re.compile(r'\b(?:zeroext|signext)\s+')
+extern_fns = set()
+
+def strip_declare_ret_ext(m):
+    if m.group(3) in defined_syms or m.group(3).startswith('llvm.'):
+        return m.group(0)
+    extern_fns.add(m.group(3))
+    return m.group(1) + _EXT.sub('', m.group(2)) + '@' + m.group(3) + '('
+
+text = re.sub(
+    r'^(declare\s+(?:!dbg\s+!\d+\s+)?)([^@\n]*)@([A-Za-z0-9_.$]+)\(',
+    strip_declare_ret_ext, text, flags=re.MULTILINE)
+
+def strip_call_ret_ext(m):
+    if m.group(3) not in extern_fns:
+        return m.group(0)
+    return m.group(1) + _EXT.sub('', m.group(2)) + '@' + m.group(3) + '('
+
+# [^@%\n]* stops at the callee, so an indirect call (callee is a %value) and
+# attributes on the arguments are never touched.
+text = re.sub(
+    r'^(\s+(?:%\S+\s*=\s*)?(?:(?:tail|musttail|notail)\s+)?(?:call|invoke)\s+)'
+    r'([^@%\n]*)@([A-Za-z0-9_.$]+)\(',
+    strip_call_ret_ext, text, flags=re.MULTILINE)
+
 # LLC lowers 'resume' instructions to calls to _Unwind_Resume.
 # Replace resume with a direct call so BTF/.ksyms picks it up.
 if re.search(r'^\s+resume\s', text, re.MULTILINE):
